@@ -1023,21 +1023,20 @@ def fetch_quotes_bulk(tickers, max_workers=8):
 # =============================================================================
 # DATA FETCHING FUNCTIONS
 # =============================================================================
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=180)  # Increased from 60s to 3min for better performance
 def fetch_quote(ticker):
-    """Fetch current quote with extended data"""
+    """Fetch current quote with extended data - optimized version"""
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="1mo")
+        # Optimized: Use 5d instead of 1mo for faster fetching
+        hist = stock.history(period="5d")
         if hist.empty:
             logger.debug(f"No history data for {ticker}")
             return None
         
+        # Skip stock.info by default as it's very slow
+        # Can be fetched separately if needed with fetch_ticker_info()
         info = {}
-        try:
-            info = stock.info
-        except Exception as e:
-            logger.debug(f"Could not fetch info for {ticker}: {e}")
         
         current = hist['Close'].iloc[-1]
         prev = hist['Close'].iloc[-2] if len(hist) > 1 else current
@@ -1054,14 +1053,25 @@ def fetch_quote(ticker):
             'week_high': hist['High'].max(),
             'week_low': hist['Low'].min(),
             'history': hist,
-            'info': info
+            'info': info  # Empty by default for speed
         }
     except Exception as e:
         logger.warning(f"Error fetching quote for {ticker}: {e}")
         return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)  # Cache for 1 hour - ticker info changes rarely
+def fetch_ticker_info(ticker):
+    """Fetch detailed ticker info separately (slow operation, heavily cached)"""
+    try:
+        stock = yf.Ticker(ticker)
+        return stock.info
+    except Exception as e:
+        logger.debug(f"Error fetching info for {ticker}: {e}")
+        return {}
+
+
+@st.cache_data(ttl=600)  # Increased from 300s to 10min
 def fetch_history(ticker, start_date=None, end_date=None, period="1y"):
     """Fetch historical data with custom date range"""
     try:
@@ -1076,7 +1086,7 @@ def fetch_history(ticker, start_date=None, end_date=None, period="1y"):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased from 300s to 10min
 def fetch_multiple(tickers, start_date=None, end_date=None, period="1y"):
     """Fetch multiple tickers"""
     try:
@@ -1106,7 +1116,7 @@ def fetch_multiple(tickers, start_date=None, end_date=None, period="1y"):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800)  # Increased to 30min - economic data changes slowly
 def fetch_fred_series(series_id, months=60):
     """Fetch FRED economic data"""
     if not FRED_OK:
@@ -1126,7 +1136,7 @@ def fetch_fred_series(series_id, months=60):
         return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800)  # Increased to 30min - CPI data changes monthly
 def fetch_cpi_yoy():
     """Calculate CPI Year-over-Year"""
     data = fetch_fred_series("CPIAUCSL", 24)
@@ -1136,7 +1146,7 @@ def fetch_cpi_yoy():
     return None
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)  # Increased from 120s to 5min - market events update periodically
 def fetch_polymarket(limit=300):
     """Fetch Polymarket events"""
     response = http_get_with_retries(
@@ -1178,7 +1188,7 @@ def search_polymarket(events, keywords, max_results=6):
     return sorted(matches, key=lambda x: x['score'], reverse=True)[:max_results]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased from 300s to 10min - news updates less frequently than quotes
 def fetch_news(category="general"):
     """Fetch news from Finnhub"""
     if 'finnhub' not in API_KEYS:
@@ -1546,9 +1556,9 @@ class QuantEngine:
 # =============================================================================
 # MARKET REGIME DETECTION
 # =============================================================================
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)  # Increased from 120s to 5min - market regime doesn't change rapidly
 def detect_market_regime():
-    """Detect current market regime with multiple signals"""
+    """Detect current market regime with multiple signals - optimized version"""
     signals = {}
     score = 0
     max_score = 6
