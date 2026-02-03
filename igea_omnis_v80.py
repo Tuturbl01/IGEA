@@ -33,7 +33,21 @@ from datetime import datetime, timedelta, date
 from io import BytesIO
 import json
 import warnings
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
+
+# =============================================================================
+# LOGGING CONFIGURATION
+# =============================================================================
+logger = logging.getLogger("igea")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
 
 # Optional imports
 try:
@@ -61,11 +75,40 @@ st.set_page_config(
 # =============================================================================
 # API KEYS
 # =============================================================================
-API_KEYS = {
-    "fred": "f049602867ef7e7d3d323dce61a722e4",
-    "finnhub": "d4bh10hr01qnomk4rt90d4bh10hr01qnomk4rt9g",
-    "newsapi": "262ab245442642fab8a9afdc08965565",
-}
+def load_api_keys():
+    """Load API keys from Streamlit secrets or environment variables"""
+    keys = {}
+    
+    # Try to load from Streamlit secrets first
+    try:
+        if hasattr(st, 'secrets') and st.secrets:
+            keys['fred'] = st.secrets.get('fred_api_key', st.secrets.get('FRED_API_KEY', ''))
+            keys['finnhub'] = st.secrets.get('finnhub_api_key', st.secrets.get('FINNHUB_API_KEY', ''))
+            keys['newsapi'] = st.secrets.get('newsapi_api_key', st.secrets.get('NEWSAPI_API_KEY', ''))
+            logger.info("API keys loaded from Streamlit secrets")
+            # Filter out empty keys
+            keys = {k: v for k, v in keys.items() if v}
+            if keys:
+                return keys
+    except Exception as e:
+        logger.debug(f"Could not load from st.secrets: {e}")
+    
+    # Fallback to environment variables
+    keys['fred'] = os.getenv('FRED_API_KEY', '')
+    keys['finnhub'] = os.getenv('FINNHUB_API_KEY', '')
+    keys['newsapi'] = os.getenv('NEWSAPI_API_KEY', '')
+    
+    # Filter out empty keys
+    keys = {k: v for k, v in keys.items() if v}
+    
+    if keys:
+        logger.info(f"API keys loaded from environment variables: {list(keys.keys())}")
+    else:
+        logger.warning("No API keys found in secrets or environment variables")
+    
+    return keys
+
+API_KEYS = load_api_keys()
 
 # =============================================================================
 # SESSION STATE INITIALIZATION
@@ -902,22 +945,98 @@ st.markdown("""
 
 
 # =============================================================================
+# HTTP RETRY HELPER
+# =============================================================================
+def http_get_with_retries(url, params=None, headers=None, retries=3, backoff=1, timeout=10):
+    """
+    HTTP GET with retries and exponential backoff
+    
+    Args:
+        url: URL to fetch
+        params: Query parameters
+        headers: HTTP headers
+        retries: Number of retry attempts
+        backoff: Initial backoff time in seconds
+        timeout: Request timeout in seconds
+    
+    Returns:
+        Response object on success, None on failure
+    """
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if response.ok:
+                return response
+            logger.warning(f"HTTP {response.status_code} for {url} (attempt {attempt + 1}/{retries})")
+        except requests.exceptions.Timeout:
+            logger.warning(f"Timeout for {url} (attempt {attempt + 1}/{retries})")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Request error for {url}: {e} (attempt {attempt + 1}/{retries})")
+        
+        if attempt < retries - 1:
+            sleep_time = backoff * (2 ** attempt)
+            logger.debug(f"Retrying in {sleep_time}s...")
+            time.sleep(sleep_time)
+    
+    logger.error(f"Failed to fetch {url} after {retries} attempts")
+    return None
+
+
+# =============================================================================
+# PARALLEL QUOTE FETCHING
+# =============================================================================
+def fetch_quotes_bulk(tickers, max_workers=8):
+    """
+    Fetch multiple quotes in parallel using ThreadPoolExecutor
+    
+    Args:
+        tickers: List of ticker symbols
+        max_workers: Maximum number of parallel workers
+    
+    Returns:
+        Dictionary mapping ticker -> quote data
+    """
+    if not tickers:
+        return {}
+    
+    results = {}
+    
+    # Use ThreadPoolExecutor for parallel fetching
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all fetch tasks
+        future_to_ticker = {executor.submit(fetch_quote, ticker): ticker for ticker in tickers}
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                quote = future.result()
+                results[ticker] = quote
+                logger.debug(f"Fetched quote for {ticker}")
+            except Exception as e:
+                logger.warning(f"Error fetching quote for {ticker}: {e}")
+                results[ticker] = None
+    
+    return results
+
+
+# =============================================================================
 # DATA FETCHING FUNCTIONS
 # =============================================================================
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=180)  # Increased from 60s to 3min for better performance
 def fetch_quote(ticker):
-    """Fetch current quote with extended data"""
+    """Fetch current quote with extended data - optimized version"""
     try:
         stock = yf.Ticker(ticker)
-        hist = stock.history(period="1mo")
+        # Optimized: Use 5d instead of 1mo for faster fetching
+        hist = stock.history(period="5d")
         if hist.empty:
+            logger.debug(f"No history data for {ticker}")
             return None
         
+        # Skip stock.info by default as it's very slow
+        # Can be fetched separately if needed with fetch_ticker_info()
         info = {}
-        try:
-            info = stock.info
-        except:
-            pass
         
         current = hist['Close'].iloc[-1]
         prev = hist['Close'].iloc[-2] if len(hist) > 1 else current
@@ -934,13 +1053,40 @@ def fetch_quote(ticker):
             'week_high': hist['High'].max(),
             'week_low': hist['Low'].min(),
             'history': hist,
-            'info': info
+            'info': info  # Empty by default for speed
         }
     except Exception as e:
+        logger.warning(f"Error fetching quote for {ticker}: {e}")
         return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)  # Cache for 1 hour - ticker info changes rarely
+def fetch_ticker_info(ticker):
+    """Fetch detailed ticker info separately (slow operation, heavily cached)"""
+    try:
+        stock = yf.Ticker(ticker)
+        return stock.info
+    except Exception as e:
+        logger.debug(f"Error fetching info for {ticker}: {e}")
+        return {}
+
+
+@st.cache_data(ttl=600)  # Cache for 10min - sparkline data for mini charts
+def fetch_sparkline_data(ticker):
+    """Fetch 1 month of data specifically for sparkline charts"""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1mo")
+        if hist.empty:
+            logger.debug(f"No sparkline data for {ticker}")
+            return None
+        return hist['Close']
+    except Exception as e:
+        logger.debug(f"Error fetching sparkline data for {ticker}: {e}")
+        return None
+
+
+@st.cache_data(ttl=600)  # Increased from 300s to 10min
 def fetch_history(ticker, start_date=None, end_date=None, period="1y"):
     """Fetch historical data with custom date range"""
     try:
@@ -950,11 +1096,12 @@ def fetch_history(ticker, start_date=None, end_date=None, period="1y"):
         else:
             hist = stock.history(period=period)
         return hist
-    except:
+    except Exception as e:
+        logger.warning(f"Error fetching history for {ticker}: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased from 300s to 10min
 def fetch_multiple(tickers, start_date=None, end_date=None, period="1y"):
     """Fetch multiple tickers"""
     try:
@@ -964,6 +1111,7 @@ def fetch_multiple(tickers, start_date=None, end_date=None, period="1y"):
             data = yf.download(tickers, period=period, progress=False)
         
         if data.empty:
+            logger.debug(f"No data returned for tickers: {tickers}")
             return pd.DataFrame()
         
         if isinstance(data.columns, pd.MultiIndex):
@@ -978,44 +1126,61 @@ def fetch_multiple(tickers, start_date=None, end_date=None, period="1y"):
             prices = prices.to_frame(tickers[0] if isinstance(tickers, list) else tickers)
         
         return prices.ffill().dropna()
-    except:
+    except Exception as e:
+        logger.warning(f"Error fetching multiple tickers {tickers}: {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800)  # Increased to 30min - economic data changes slowly
 def fetch_fred_series(series_id, months=60):
     """Fetch FRED economic data"""
     if not FRED_OK:
+        logger.debug("FRED library not available")
         return None
+    
+    if 'fred' not in API_KEYS:
+        logger.warning("FRED API key not configured")
+        return None
+    
     try:
         fred = Fred(api_key=API_KEYS['fred'])
         data = fred.get_series(series_id, observation_start=datetime.now() - timedelta(days=months * 31))
         return data.dropna()
-    except:
+    except Exception as e:
+        logger.warning(f"Error fetching FRED series {series_id}: {e}")
         return None
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=1800)  # Increased to 30min - CPI data changes monthly
 def fetch_cpi_yoy():
     """Calculate CPI Year-over-Year"""
     data = fetch_fred_series("CPIAUCSL", 24)
     if data is not None and len(data) >= 13:
         return ((data.iloc[-1] - data.iloc[-13]) / data.iloc[-13]) * 100
+    logger.debug("Insufficient CPI data for YoY calculation")
     return None
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)  # Increased from 120s to 5min - market events update periodically
 def fetch_polymarket(limit=300):
     """Fetch Polymarket events"""
-    try:
-        r = requests.get(
-            "https://gamma-api.polymarket.com/events",
-            params={"limit": limit, "active": "true", "closed": "false"},
-            timeout=15
-        )
-        return r.json() if r.ok else []
-    except:
-        return []
+    response = http_get_with_retries(
+        "https://gamma-api.polymarket.com/events",
+        params={"limit": limit, "active": "true", "closed": "false"},
+        retries=3,
+        backoff=1,
+        timeout=15
+    )
+    
+    if response:
+        try:
+            return response.json()
+        except Exception as e:
+            logger.warning(f"Error parsing Polymarket response: {e}")
+            return []
+    
+    logger.warning("Failed to fetch Polymarket events")
+    return []
 
 
 def search_polymarket(events, keywords, max_results=6):
@@ -1038,24 +1203,38 @@ def search_polymarket(events, keywords, max_results=6):
     return sorted(matches, key=lambda x: x['score'], reverse=True)[:max_results]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=600)  # Increased from 300s to 10min - news updates less frequently than quotes
 def fetch_news(category="general"):
     """Fetch news from Finnhub"""
-    try:
-        r = requests.get(
-            "https://finnhub.io/api/v1/news",
-            params={"token": API_KEYS['finnhub'], "category": category},
-            timeout=10
-        )
-        return r.json()[:20] if r.ok else []
-    except:
+    if 'finnhub' not in API_KEYS:
+        logger.warning("Finnhub API key not configured")
         return []
+    
+    response = http_get_with_retries(
+        "https://finnhub.io/api/v1/news",
+        params={"token": API_KEYS['finnhub'], "category": category},
+        retries=3,
+        backoff=1,
+        timeout=10
+    )
+    
+    if response:
+        try:
+            data = response.json()
+            return data[:20] if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning(f"Error parsing Finnhub news response: {e}")
+            return []
+    
+    logger.warning("Failed to fetch news from Finnhub")
+    return []
 
 
 @st.cache_data(ttl=600)
 def fetch_google_trends(keywords):
     """Fetch Google Trends data"""
     if not TRENDS_OK:
+        logger.debug("Google Trends library not available, using random data")
         dates = pd.date_range(end=datetime.now(), periods=90, freq='D')
         return pd.DataFrame({kw: np.random.randint(30, 100, 90) for kw in keywords}, index=dates)
     
@@ -1068,7 +1247,8 @@ def fetch_google_trends(keywords):
         if 'isPartial' in data.columns:
             data = data.drop(columns=['isPartial'])
         return data
-    except:
+    except Exception as e:
+        logger.warning(f"Error fetching Google Trends for {keywords}: {e}")
         dates = pd.date_range(end=datetime.now(), periods=90, freq='D')
         return pd.DataFrame({kw: np.random.randint(30, 100, 90) for kw in keywords}, index=dates)
 
@@ -1391,29 +1571,41 @@ class QuantEngine:
 # =============================================================================
 # MARKET REGIME DETECTION
 # =============================================================================
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)  # Increased from 120s to 5min - market regime doesn't change rapidly
 def detect_market_regime():
-    """Detect current market regime with multiple signals"""
+    """Detect current market regime with multiple signals - optimized version"""
     signals = {}
     score = 0
     max_score = 6
     
-    # Signal 1: SPY > SMA50
+    # Signal 1: SPY > SMA50 and SMA200
     try:
-        spy = yf.Ticker("SPY").history(period="3mo")
+        # Fetch enough history for SMA200
+        spy = yf.Ticker("SPY").history(period="1y")
         if not spy.empty and len(spy) >= 50:
             price = spy['Close'].iloc[-1]
             sma50 = spy['Close'].rolling(50).mean().iloc[-1]
-            sma200 = spy['Close'].rolling(200).mean().iloc[-1] if len(spy) >= 200 else sma50
+            
+            # Only calculate SMA200 if we have enough data
+            if len(spy) >= 200:
+                sma200 = spy['Close'].rolling(200).mean().iloc[-1]
+                signals['spy_sma200'] = price > sma200
+                signals['golden_cross'] = sma50 > sma200
+                if signals.get('golden_cross'):
+                    score += 1
+            else:
+                # Not enough data for SMA200
+                signals['spy_sma200'] = None
+                signals['golden_cross'] = None
+                logger.debug(f"Insufficient data for SMA200 (only {len(spy)} days)")
+            
             signals['spy_sma50'] = price > sma50
-            signals['spy_sma200'] = price > sma200
-            signals['golden_cross'] = sma50 > sma200
             if signals['spy_sma50']:
                 score += 1
-            if signals['golden_cross']:
-                score += 1
-    except:
-        pass
+        else:
+            logger.debug("Insufficient SPY data for regime detection")
+    except Exception as e:
+        logger.warning(f"Error in SPY regime signal: {e}")
     
     # Signal 2: VIX < 20
     try:
@@ -1422,8 +1614,8 @@ def detect_market_regime():
             signals['vix'] = vix['Close'].iloc[-1]
             if signals['vix'] < 20:
                 score += 1
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Error in VIX regime signal: {e}")
     
     # Signal 3: DXY trend
     try:
@@ -1432,11 +1624,11 @@ def detect_market_regime():
             signals['dxy_down'] = dxy['Close'].iloc[-1] < dxy['Close'].iloc[0]
             if signals['dxy_down']:
                 score += 1
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Error in DXY regime signal: {e}")
     
     # Signal 4: Yield Curve
-    if FRED_OK:
+    if FRED_OK and 'fred' in API_KEYS:
         try:
             fred = Fred(api_key=API_KEYS['fred'])
             spread = fred.get_series('T10Y2Y', observation_start=datetime.now() - timedelta(days=30))
@@ -1444,8 +1636,8 @@ def detect_market_regime():
                 signals['yield_spread'] = spread.iloc[-1]
                 if spread.iloc[-1] > 0:
                     score += 1
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Error in yield curve regime signal: {e}")
     
     # Signal 5: High Yield Spread
     try:
@@ -1456,8 +1648,8 @@ def detect_market_regime():
             signals['credit_spread'] = spread_change > 0
             if signals['credit_spread']:
                 score += 1
-    except:
-        pass
+    except Exception as e:
+        logger.debug(f"Error in credit spread regime signal: {e}")
     
     signals['score'] = score
     signals['max_score'] = max_score
@@ -1763,9 +1955,17 @@ def show_metric_card(label, value, delta=None, prefix="", suffix=""):
     """, unsafe_allow_html=True)
 
 
-def show_asset_row(name, ticker, icon="📈", show_chart=True):
-    """Display an asset row with sparkline"""
-    quote = fetch_quote(ticker)
+def show_asset_row(name, ticker, icon="📈", show_chart=True, prefetched_quote=None):
+    """Display an asset row with sparkline
+    
+    Args:
+        name: Display name for the asset
+        ticker: Ticker symbol
+        icon: Display icon
+        show_chart: Whether to show sparkline chart
+        prefetched_quote: Optional pre-fetched quote data to avoid redundant API calls
+    """
+    quote = prefetched_quote if prefetched_quote is not None else fetch_quote(ticker)
     
     col1, col2, col3 = st.columns([2, 3, 2])
     
@@ -1774,35 +1974,41 @@ def show_asset_row(name, ticker, icon="📈", show_chart=True):
         st.caption(f"`{ticker}`")
     
     with col2:
-        if show_chart and quote and quote.get('history') is not None and len(quote['history']) > 1:
-            fig = create_sparkline(quote['history']['Close'], height=45)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True, key=f"spark_{ticker}_{name}_{hash(name)}")
+        if show_chart:
+            # Use dedicated sparkline data (1 month) for better visualization
+            sparkline_data = fetch_sparkline_data(ticker)
+            if sparkline_data is not None and len(sparkline_data) > 1:
+                fig = create_sparkline(sparkline_data, height=45)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True, key=f"spark_{ticker}_{name}_{hash(name)}")
     
     with col3:
         if quote:
-            price = quote['price']
-            change = quote['change']
+            price = quote.get('price')
+            change = quote.get('change')
             
-            # Format price
-            if price > 10000:
-                price_str = f"{price:,.0f}"
-            elif price > 100:
-                price_str = f"{price:,.2f}"
-            elif price > 1:
-                price_str = f"{price:.4f}"
+            if price is not None and change is not None:
+                # Format price
+                if price > 10000:
+                    price_str = f"{price:,.0f}"
+                elif price > 100:
+                    price_str = f"{price:,.2f}"
+                elif price > 1:
+                    price_str = f"{price:.4f}"
+                else:
+                    price_str = f"{price:.6f}"
+                
+                color = "#10b981" if change >= 0 else "#ef4444"
+                arrow = "▲" if change >= 0 else "▼"
+                
+                st.markdown(f"""
+                <div style="text-align: right;">
+                    <div class="price-value">{price_str}</div>
+                    <div class="price-change" style="color: {color};">{arrow} {abs(change):.2f}%</div>
+                </div>
+                """, unsafe_allow_html=True)
             else:
-                price_str = f"{price:.6f}"
-            
-            color = "#10b981" if change >= 0 else "#ef4444"
-            arrow = "▲" if change >= 0 else "▼"
-            
-            st.markdown(f"""
-            <div style="text-align: right;">
-                <div class="price-value">{price_str}</div>
-                <div class="price-change" style="color: {color};">{arrow} {abs(change):.2f}%</div>
-            </div>
-            """, unsafe_allow_html=True)
+                st.markdown("<div style='text-align: right; color: #94a3b8;'>N/A</div>", unsafe_allow_html=True)
         else:
             st.markdown("<div style='text-align: right; color: #94a3b8;'>N/A</div>", unsafe_allow_html=True)
 
@@ -1837,8 +2043,8 @@ def show_news_card(article):
         try:
             dt = datetime.fromtimestamp(timestamp)
             time_str = dt.strftime("%H:%M")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Error parsing timestamp {timestamp}: {e}")
     
     st.markdown(f"""
     <div class="news-card">
@@ -1901,45 +2107,49 @@ def tab_dashboard():
     st.markdown("<div class='section-header'><span class='section-title'>📊 Market Overview</span></div>", unsafe_allow_html=True)
     st.markdown("<div class='section-subtitle'>Real-time market snapshot and key indicators</div>", unsafe_allow_html=True)
     
-    # Quick stats row
+    # Quick stats row - use bulk fetching for better performance
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     
-    spy = fetch_quote("SPY")
+    # Fetch all quotes in parallel
+    quick_stats_tickers = ["SPY", "QQQ", "^VIX", "DX-Y.NYB", "GC=F", "BTC-USD"]
+    quotes = fetch_quotes_bulk(quick_stats_tickers, max_workers=6)
+    
+    spy = quotes.get("SPY")
     with col1:
         if spy:
             show_metric_card("S&P 500", f"{spy['price']:,.2f}", spy['change'], "$")
         else:
             show_metric_card("S&P 500", "N/A")
     
-    qqq = fetch_quote("QQQ")
+    qqq = quotes.get("QQQ")
     with col2:
         if qqq:
             show_metric_card("NASDAQ", f"{qqq['price']:,.2f}", qqq['change'], "$")
         else:
             show_metric_card("NASDAQ", "N/A")
     
-    vix = fetch_quote("^VIX")
+    vix = quotes.get("^VIX")
     with col3:
         if vix:
             show_metric_card("VIX", f"{vix['price']:.2f}", vix['change'])
         else:
             show_metric_card("VIX", "N/A")
     
-    dxy = fetch_quote("DX-Y.NYB")
+    dxy = quotes.get("DX-Y.NYB")
     with col4:
         if dxy:
             show_metric_card("DXY", f"{dxy['price']:.2f}", dxy['change'])
         else:
             show_metric_card("DXY", "N/A")
     
-    gold = fetch_quote("GC=F")
+    gold = quotes.get("GC=F")
     with col5:
         if gold:
             show_metric_card("Gold", f"{gold['price']:,.0f}", gold['change'], "$")
         else:
             show_metric_card("Gold", "N/A")
     
-    btc = fetch_quote("BTC-USD")
+    btc = quotes.get("BTC-USD")
     with col6:
         if btc:
             show_metric_card("Bitcoin", f"{btc['price']:,.0f}", btc['change'], "$")
@@ -1972,9 +2182,13 @@ def tab_dashboard():
     with col2:
         st.markdown("#### 🏭 Sector Performance")
         
+        # Bulk fetch sector quotes
+        sector_tickers = [info['ticker'] for info in SECTORS.values()]
+        sector_quotes = fetch_quotes_bulk(sector_tickers, max_workers=8)
+        
         sector_perf = {}
         for name, info in SECTORS.items():
-            q = fetch_quote(info['ticker'])
+            q = sector_quotes.get(info['ticker'])
             if q:
                 sector_perf[name] = q['change']
         
@@ -2183,10 +2397,15 @@ def tab_bonds():
     
     col1, col2 = st.columns([2, 1])
     
+    # Bulk fetch all bond quotes
+    bond_tickers = [info['ticker'] for info in BONDS.values()]
+    bond_quotes = fetch_quotes_bulk(bond_tickers, max_workers=6)
+    
     with col1:
         st.markdown("#### US Treasury Yields")
         for name, info in BONDS.items():
-            show_asset_row(name, info['ticker'], "🇺🇸")
+            show_asset_row(name, info['ticker'], "🇺🇸", 
+                          prefetched_quote=bond_quotes.get(info['ticker']))
     
     with col2:
         st.markdown("#### Yield Curve")
@@ -2195,7 +2414,7 @@ def tab_bonds():
         yields_data = []
         
         for info in BONDS.values():
-            q = fetch_quote(info['ticker'])
+            q = bond_quotes.get(info['ticker'])
             yields_data.append(q['price'] if q else None)
         
         if all(y is not None for y in yields_data):
@@ -2293,10 +2512,15 @@ def tab_crypto():
     
     col1, col2 = st.columns([2, 1])
     
+    # Bulk fetch all crypto quotes
+    crypto_tickers = [info['ticker'] for info in CRYPTO.values()]
+    crypto_quotes = fetch_quotes_bulk(crypto_tickers, max_workers=8)
+    
     with col1:
         st.markdown("#### Major Cryptocurrencies")
         for name, info in CRYPTO.items():
-            show_asset_row(name, info['ticker'], info['symbol'])
+            show_asset_row(name, info['ticker'], info['symbol'], 
+                          prefetched_quote=crypto_quotes.get(info['ticker']))
         
         st.markdown("---")
         st.markdown("#### Bitcoin Chart")
@@ -2325,8 +2549,8 @@ def tab_crypto():
         st.markdown("---")
         st.markdown("#### Market Stats")
         
-        btc = fetch_quote("BTC-USD")
-        eth = fetch_quote("ETH-USD")
+        btc = crypto_quotes.get("BTC-USD")
+        eth = crypto_quotes.get("ETH-USD")
         
         if btc and eth:
             eth_btc = eth['price'] / btc['price']
@@ -2345,10 +2569,16 @@ def tab_tech():
     
     col1, col2 = st.columns([1, 2])
     
+    # Bulk fetch tech stocks
+    tech_stocks_list = list(TECH_STOCKS.items())[:12]
+    tech_tickers = [info['ticker'] for name, info in tech_stocks_list]
+    tech_quotes = fetch_quotes_bulk(tech_tickers, max_workers=8)
+    
     with col1:
         st.markdown("#### Tech Stocks")
-        for name, info in list(TECH_STOCKS.items())[:12]:
-            show_asset_row(name, info['ticker'], "💻")
+        for name, info in tech_stocks_list:
+            show_asset_row(name, info['ticker'], "💻", 
+                          prefetched_quote=tech_quotes.get(info['ticker']))
     
     with col2:
         st.markdown("#### Stock Analysis")
@@ -2397,26 +2627,49 @@ def tab_markets():
     
     with col1:
         st.markdown("#### Global Indices")
-        for name, info in INDICES.items():
-            if region == "All" or info['region'] == region:
-                show_asset_row(name, info['ticker'], info['flag'])
+        
+        # Collect tickers to fetch based on region filter
+        indices_to_show = [(name, info) for name, info in INDICES.items() 
+                          if region == "All" or info['region'] == region]
+        indices_tickers = [info['ticker'] for name, info in indices_to_show]
+        
+        # Bulk fetch quotes for indices
+        indices_quotes = fetch_quotes_bulk(indices_tickers, max_workers=8)
+        
+        # Display with pre-fetched quotes
+        for name, info in indices_to_show:
+            show_asset_row(name, info['ticker'], info['flag'], 
+                          prefetched_quote=indices_quotes.get(info['ticker']))
         
         st.markdown("---")
         st.markdown("#### Commodities")
         
         comm_cat = st.radio("Category", ["All", "Precious Metals", "Energy", "Agriculture"], horizontal=True, key="comm_cat")
         
-        for name, info in COMMODITIES.items():
-            if comm_cat == "All" or info['category'] == comm_cat:
-                show_asset_row(name, info['ticker'], info['emoji'])
+        # Collect commodity tickers based on category filter
+        commodities_to_show = [(name, info) for name, info in COMMODITIES.items() 
+                               if comm_cat == "All" or info['category'] == comm_cat]
+        commodities_tickers = [info['ticker'] for name, info in commodities_to_show]
+        
+        # Bulk fetch quotes for commodities
+        commodities_quotes = fetch_quotes_bulk(commodities_tickers, max_workers=8)
+        
+        # Display with pre-fetched quotes
+        for name, info in commodities_to_show:
+            show_asset_row(name, info['ticker'], info['emoji'], 
+                          prefetched_quote=commodities_quotes.get(info['ticker']))
     
     with col2:
         st.markdown("#### Smart Money Ratios")
         
+        # Fetch all ratio tickers in parallel
+        ratio_tickers = ["XLY", "XLP", "SPY", "TLT", "HG=F", "GC=F"]
+        ratio_quotes = fetch_quotes_bulk(ratio_tickers, max_workers=6)
+        
         # XLY/XLP Ratio
         st.markdown("**Consumer Disc./Staples (Risk Appetite)**")
-        xly = fetch_quote("XLY")
-        xlp = fetch_quote("XLP")
+        xly = ratio_quotes.get("XLY")
+        xlp = ratio_quotes.get("XLP")
         if xly and xlp:
             ratio = xly['price'] / xlp['price']
             spread = xly['change'] - xlp['change']
@@ -2433,8 +2686,8 @@ def tab_markets():
         
         # SPY/TLT Ratio
         st.markdown("**Stocks/Bonds Ratio**")
-        spy = fetch_quote("SPY")
-        tlt = fetch_quote("TLT")
+        spy = ratio_quotes.get("SPY")
+        tlt = ratio_quotes.get("TLT")
         if spy and tlt:
             ratio = spy['price'] / tlt['price']
             spread = spy['change'] - tlt['change']
@@ -2451,8 +2704,8 @@ def tab_markets():
         
         # Copper/Gold Ratio
         st.markdown("**Copper/Gold (Economic Growth)**")
-        copper = fetch_quote("HG=F")
-        gold = fetch_quote("GC=F")
+        copper = ratio_quotes.get("HG=F")
+        gold = ratio_quotes.get("GC=F")
         if copper and gold:
             ratio = copper['price'] / gold['price'] * 1000
             show_metric_card("Cu/Au Ratio", f"{ratio:.2f}")
@@ -2463,6 +2716,49 @@ def tab_compare():
     st.markdown("<div class='section-header'><span class='section-title'>🔍 Compare & Analyze</span></div>", unsafe_allow_html=True)
     st.markdown("<div class='section-subtitle'>Custom asset comparison with detailed analytics</div>", unsafe_allow_html=True)
     
+    # Quick Selection Buttons
+    st.markdown("#### 🚀 Sélection Rapide / Quick Select")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**📊 Indices Majeurs**")
+        if st.button("🇺🇸 Indices US (SPY, QQQ, IWM)", key="preset_us_indices"):
+            st.session_state.comparison_assets = ["SPY", "QQQ", "IWM"]
+            st.rerun()
+        if st.button("🌍 Indices Mondiaux", key="preset_world_indices"):
+            st.session_state.comparison_assets = ["SPY", "EWJ", "EWU", "FEZ"]
+            st.rerun()
+        if st.button("📈 Tech vs Value (QQQ, VTV)", key="preset_tech_value"):
+            st.session_state.comparison_assets = ["QQQ", "VTV", "SPY"]
+            st.rerun()
+    
+    with col2:
+        st.markdown("**🏢 Actions Populaires**")
+        if st.button("💻 FAANG", key="preset_faang"):
+            st.session_state.comparison_assets = ["AAPL", "AMZN", "GOOGL", "META", "NFLX"]
+            st.rerun()
+        if st.button("🚗 Magnificent 7", key="preset_mag7"):
+            st.session_state.comparison_assets = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+            st.rerun()
+        if st.button("🔌 Semi-conducteurs", key="preset_semis"):
+            st.session_state.comparison_assets = ["NVDA", "AMD", "INTC", "TSM"]
+            st.rerun()
+    
+    with col3:
+        st.markdown("**💰 Autres Assets**")
+        if st.button("🏦 Banques US", key="preset_banks"):
+            st.session_state.comparison_assets = ["JPM", "BAC", "WFC", "C"]
+            st.rerun()
+        if st.button("⚡ Énergie", key="preset_energy"):
+            st.session_state.comparison_assets = ["XLE", "XOM", "CVX"]
+            st.rerun()
+        if st.button("🪙 Crypto vs Or", key="preset_crypto_gold"):
+            st.session_state.comparison_assets = ["BTC-USD", "ETH-USD", "GC=F"]
+            st.rerun()
+    
+    st.markdown("---")
+    
     # Inputs
     col1, col2, col3 = st.columns([2, 1, 1])
     
@@ -2470,7 +2766,8 @@ def tab_compare():
         tickers_input = st.text_input(
             "Assets (comma-separated)",
             value=", ".join(st.session_state.comparison_assets),
-            key="compare_tickers"
+            key="compare_tickers",
+            help="Entrez les symboles séparés par des virgules, ou utilisez les boutons de sélection rapide ci-dessus"
         )
     
     with col2:
@@ -2496,11 +2793,44 @@ def tab_compare():
     
     st.markdown("---")
     
-    # Performance Chart
-    st.markdown("#### 📈 Normalized Performance (Base 100)")
+    # Performance Chart with clear base 100 indication
+    st.markdown("#### 📈 Performance Normalisée (Base 100)")
+    st.caption("Tous les actifs démarrent à 100 pour comparer la performance relative")
     normalized = (prices / prices.iloc[0]) * 100
     fig = create_line_chart(normalized, height=400)
+    
+    # Add annotation about base 100
+    fig.update_layout(
+        annotations=[
+            dict(
+                text="Base 100 : Toutes les valeurs normalisées au point de départ",
+                xref="paper", yref="paper",
+                x=0.5, y=1.05,
+                showarrow=False,
+                font=dict(size=11, color="#64748b"),
+                xanchor='center'
+            )
+        ]
+    )
+    
     st.plotly_chart(fig, use_container_width=True, key="perf_chart")
+    
+    # Show current values in base 100
+    st.markdown("**📊 Valeurs Actuelles (Base 100)**")
+    cols = st.columns(min(len(tickers), 6))
+    for i, ticker in enumerate(tickers[:6]):
+        if ticker in normalized.columns:
+            current_val = normalized[ticker].iloc[-1]
+            gain = current_val - 100
+            with cols[i]:
+                color = "#10b981" if gain >= 0 else "#ef4444"
+                st.markdown(f"""
+                <div style="text-align: center; padding: 10px; background: #f8fafc; border-radius: 8px;">
+                    <div style="font-weight: 600; color: #0f172a;">{ticker}</div>
+                    <div style="font-size: 1.5rem; color: {color}; font-weight: 700;">{current_val:.1f}</div>
+                    <div style="font-size: 0.85rem; color: {color};">{'▲' if gain >= 0 else '▼'} {abs(gain):.1f}%</div>
+                </div>
+                """, unsafe_allow_html=True)
     
     st.markdown("---")
     
@@ -2588,7 +2918,8 @@ def tab_portfolio():
         
         try:
             weights = [float(w.strip()) for w in weights_input.split(",")]
-        except:
+        except Exception as e:
+            logger.debug(f"Error parsing weights, using equal weights: {e}")
             weights = [1/len(tickers)] * len(tickers)
         
         if len(weights) != len(tickers):
@@ -2759,9 +3090,13 @@ def tab_watchlist():
         
         st.markdown("---")
         
-        # Display assets
+        # Bulk fetch all watchlist quotes for better performance
+        watchlist_quotes = fetch_quotes_bulk(st.session_state.watchlist, max_workers=8)
+        
+        # Display assets with pre-fetched quotes
         for ticker in st.session_state.watchlist:
-            show_asset_row(ticker, ticker, "⭐")
+            show_asset_row(ticker, ticker, "⭐", 
+                          prefetched_quote=watchlist_quotes.get(ticker))
         
         # Performance comparison
         st.markdown("---")
@@ -3003,13 +3338,18 @@ def render_sidebar():
         
         # Quick Stats
         st.markdown("#### Quick Stats")
-        spy = fetch_quote("SPY")
+        
+        # Fetch sidebar stats in parallel
+        sidebar_tickers = ["SPY", "^VIX"]
+        sidebar_quotes = fetch_quotes_bulk(sidebar_tickers, max_workers=2)
+        
+        spy = sidebar_quotes.get("SPY")
         if spy:
             color = "#10b981" if spy['change'] >= 0 else "#ef4444"
             arrow = "▲" if spy['change'] >= 0 else "▼"
             st.markdown(f"**S&P 500**: ${spy['price']:,.2f} <span style='color:{color}'>{arrow}{abs(spy['change']):.2f}%</span>", unsafe_allow_html=True)
         
-        vix_q = fetch_quote("^VIX")
+        vix_q = sidebar_quotes.get("^VIX")
         if vix_q:
             color = "#10b981" if vix_q['price'] < 20 else "#f59e0b" if vix_q['price'] < 30 else "#ef4444"
             st.markdown(f"**VIX**: <span style='color:{color}'>{vix_q['price']:.2f}</span>", unsafe_allow_html=True)
