@@ -1071,6 +1071,21 @@ def fetch_ticker_info(ticker):
         return {}
 
 
+@st.cache_data(ttl=600)  # Cache for 10min - sparkline data for mini charts
+def fetch_sparkline_data(ticker):
+    """Fetch 1 month of data specifically for sparkline charts"""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1mo")
+        if hist.empty:
+            logger.debug(f"No sparkline data for {ticker}")
+            return None
+        return hist['Close']
+    except Exception as e:
+        logger.debug(f"Error fetching sparkline data for {ticker}: {e}")
+        return None
+
+
 @st.cache_data(ttl=600)  # Increased from 300s to 10min
 def fetch_history(ticker, start_date=None, end_date=None, period="1y"):
     """Fetch historical data with custom date range"""
@@ -1959,10 +1974,13 @@ def show_asset_row(name, ticker, icon="📈", show_chart=True, prefetched_quote=
         st.caption(f"`{ticker}`")
     
     with col2:
-        if show_chart and quote and quote.get('history') is not None and len(quote['history']) > 1:
-            fig = create_sparkline(quote['history']['Close'], height=45)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True, key=f"spark_{ticker}_{name}_{hash(name)}")
+        if show_chart:
+            # Use dedicated sparkline data (1 month) for better visualization
+            sparkline_data = fetch_sparkline_data(ticker)
+            if sparkline_data is not None and len(sparkline_data) > 1:
+                fig = create_sparkline(sparkline_data, height=45)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True, key=f"spark_{ticker}_{name}_{hash(name)}")
     
     with col3:
         if quote:
@@ -2698,6 +2716,49 @@ def tab_compare():
     st.markdown("<div class='section-header'><span class='section-title'>🔍 Compare & Analyze</span></div>", unsafe_allow_html=True)
     st.markdown("<div class='section-subtitle'>Custom asset comparison with detailed analytics</div>", unsafe_allow_html=True)
     
+    # Quick Selection Buttons
+    st.markdown("#### 🚀 Sélection Rapide / Quick Select")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.markdown("**📊 Indices Majeurs**")
+        if st.button("🇺🇸 Indices US (SPY, QQQ, IWM)", key="preset_us_indices"):
+            st.session_state.comparison_assets = ["SPY", "QQQ", "IWM"]
+            st.rerun()
+        if st.button("🌍 Indices Mondiaux", key="preset_world_indices"):
+            st.session_state.comparison_assets = ["SPY", "EWJ", "EWU", "FEZ"]
+            st.rerun()
+        if st.button("📈 Tech vs Value (QQQ, VTV)", key="preset_tech_value"):
+            st.session_state.comparison_assets = ["QQQ", "VTV", "SPY"]
+            st.rerun()
+    
+    with col2:
+        st.markdown("**🏢 Actions Populaires**")
+        if st.button("💻 FAANG", key="preset_faang"):
+            st.session_state.comparison_assets = ["AAPL", "AMZN", "GOOGL", "META", "NFLX"]
+            st.rerun()
+        if st.button("🚗 Magnificent 7", key="preset_mag7"):
+            st.session_state.comparison_assets = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"]
+            st.rerun()
+        if st.button("🔌 Semi-conducteurs", key="preset_semis"):
+            st.session_state.comparison_assets = ["NVDA", "AMD", "INTC", "TSM"]
+            st.rerun()
+    
+    with col3:
+        st.markdown("**💰 Autres Assets**")
+        if st.button("🏦 Banques US", key="preset_banks"):
+            st.session_state.comparison_assets = ["JPM", "BAC", "WFC", "C"]
+            st.rerun()
+        if st.button("⚡ Énergie", key="preset_energy"):
+            st.session_state.comparison_assets = ["XLE", "XOM", "CVX"]
+            st.rerun()
+        if st.button("🪙 Crypto vs Or", key="preset_crypto_gold"):
+            st.session_state.comparison_assets = ["BTC-USD", "ETH-USD", "GC=F"]
+            st.rerun()
+    
+    st.markdown("---")
+    
     # Inputs
     col1, col2, col3 = st.columns([2, 1, 1])
     
@@ -2705,7 +2766,8 @@ def tab_compare():
         tickers_input = st.text_input(
             "Assets (comma-separated)",
             value=", ".join(st.session_state.comparison_assets),
-            key="compare_tickers"
+            key="compare_tickers",
+            help="Entrez les symboles séparés par des virgules, ou utilisez les boutons de sélection rapide ci-dessus"
         )
     
     with col2:
@@ -2731,11 +2793,44 @@ def tab_compare():
     
     st.markdown("---")
     
-    # Performance Chart
-    st.markdown("#### 📈 Normalized Performance (Base 100)")
+    # Performance Chart with clear base 100 indication
+    st.markdown("#### 📈 Performance Normalisée (Base 100)")
+    st.caption("Tous les actifs démarrent à 100 pour comparer la performance relative")
     normalized = (prices / prices.iloc[0]) * 100
     fig = create_line_chart(normalized, height=400)
+    
+    # Add annotation about base 100
+    fig.update_layout(
+        annotations=[
+            dict(
+                text="Base 100 : Toutes les valeurs normalisées au point de départ",
+                xref="paper", yref="paper",
+                x=0.5, y=1.05,
+                showarrow=False,
+                font=dict(size=11, color="#64748b"),
+                xanchor='center'
+            )
+        ]
+    )
+    
     st.plotly_chart(fig, use_container_width=True, key="perf_chart")
+    
+    # Show current values in base 100
+    st.markdown("**📊 Valeurs Actuelles (Base 100)**")
+    cols = st.columns(min(len(tickers), 6))
+    for i, ticker in enumerate(tickers[:6]):
+        if ticker in normalized.columns:
+            current_val = normalized[ticker].iloc[-1]
+            gain = current_val - 100
+            with cols[i]:
+                color = "#10b981" if gain >= 0 else "#ef4444"
+                st.markdown(f"""
+                <div style="text-align: center; padding: 10px; background: #f8fafc; border-radius: 8px;">
+                    <div style="font-weight: 600; color: #0f172a;">{ticker}</div>
+                    <div style="font-size: 1.5rem; color: {color}; font-weight: 700;">{current_val:.1f}</div>
+                    <div style="font-size: 0.85rem; color: {color};">{'▲' if gain >= 0 else '▼'} {abs(gain):.1f}%</div>
+                </div>
+                """, unsafe_allow_html=True)
     
     st.markdown("---")
     
