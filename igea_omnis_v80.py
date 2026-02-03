@@ -2015,8 +2015,8 @@ def show_news_card(article):
         try:
             dt = datetime.fromtimestamp(timestamp)
             time_str = dt.strftime("%H:%M")
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"Error parsing timestamp {timestamp}: {e}")
     
     st.markdown(f"""
     <div class="news-card">
@@ -2813,7 +2813,8 @@ def tab_portfolio():
         
         try:
             weights = [float(w.strip()) for w in weights_input.split(",")]
-        except:
+        except Exception as e:
+            logger.debug(f"Error parsing weights, using equal weights: {e}")
             weights = [1/len(tickers)] * len(tickers)
         
         if len(weights) != len(tickers):
